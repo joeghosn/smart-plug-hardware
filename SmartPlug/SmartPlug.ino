@@ -9,20 +9,47 @@
  * - Heartbeat to maintain connection
  * - Energy telemetry reporting
  *
- * Required Libraries:
+ * Required Libraries (install via Arduino Library Manager):
  * - WebSockets by Markus Sattler (includes SocketIOclient)
  * - ArduinoJson by Benoit Blanchon
  *
  * Setup:
- * 1. Copy config.example.h to config.h
- * 2. Update config.h with your WiFi and server settings
- * 3. Upload to ESP32
+ * 1. Update the configuration section below with your settings
+ * 2. Upload to ESP32
  */
 
 #include <WiFi.h>
 #include <SocketIOclient.h>
 #include <ArduinoJson.h>
-#include "config.h"
+
+// ============================================
+// CONFIGURATION - UPDATE THESE VALUES
+// ============================================
+
+// WiFi Settings
+#define WIFI_SSID          "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD      "YOUR_WIFI_PASSWORD"
+
+// Server Settings
+#define SERVER_HOST        "smart-plug-backend-b4c0.onrender.com"
+#define SERVER_PORT        443
+
+// Device Settings - QR code must match device registered in dashboard
+#define DEVICE_QR_CODE     "YOUR_DEVICE_QR_CODE"
+
+// Pin Configuration
+#define LED_PIN            2    // Built-in LED (connection status)
+#define RELAY_PIN          4    // Relay control GPIO
+
+// Timing Configuration
+#define DEMO_MODE          true  // true = 30s telemetry, false = 1h telemetry
+#define HEARTBEAT_INTERVAL_MS       25000      // 25 seconds
+#define TELEMETRY_INTERVAL_DEMO_MS  30000      // 30 seconds (demo)
+#define TELEMETRY_INTERVAL_PROD_MS  3600000    // 1 hour (production)
+#define WIFI_RECONNECT_INTERVAL_MS  10000      // 10 seconds
+
+// Simulation Settings (for testing without real power sensors)
+#define SIMULATED_POWER_WATTS  100.0  // Examples: LED=10W, Fan=50W, TV=100W
 
 // ============================================
 // GLOBALS
@@ -123,7 +150,7 @@ void sendTelemetry(float energyKWh) {
   Serial.println(" kWh");
 }
 
-void sendCommandResponse(const char* commandId, bool success) {
+void sendCommandResponse(const char* commandId, bool success, const char* powerState) {
   StaticJsonDocument<256> doc;
   JsonArray arr = doc.to<JsonArray>();
   arr.add("command:response");
@@ -131,6 +158,7 @@ void sendCommandResponse(const char* commandId, bool success) {
   JsonObject data = arr.createNestedObject();
   data["commandId"] = commandId;
   data["success"] = success;
+  data["powerState"] = powerState;
 
   String payload;
   serializeJson(doc, payload);
@@ -199,13 +227,22 @@ void handleEvent(const char* payload) {
     Serial.println("========================================");
 
     setRelay(strcmp(powerState, "ON") == 0);
-    sendCommandResponse(commandId, true);
+    sendCommandResponse(commandId, true, powerState);
     return;
   }
 
   // --- HEARTBEAT ACK ---
   if (strcmp(eventName, "heartbeat:ack") == 0) {
     Serial.println("[HEARTBEAT] ACK received");
+    return;
+  }
+
+  // --- DEVICE REMOVED ---
+  if (strcmp(eventName, "device:removed") == 0) {
+    Serial.println("[WARN] Device removed from account!");
+    isAuthenticated = false;
+    setRelay(false);
+    digitalWrite(LED_PIN, LOW);
     return;
   }
 }
