@@ -1,0 +1,24 @@
+# Configuration with secrets
+SmartPlug/config.h
+**/config.h
+!**/config.example.h
+
+# Build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Arduino
+*.elf
+*.bin
