@@ -39,7 +39,17 @@
 
 // Pin Configuration
 #define LED_PIN            2    // Built-in LED (connection status)
-#define RELAY_PIN          4    // Relay control GPIO
+#define RELAY_PIN          25   // Relay control GPIO (D25, active LOW)
+#define VOLTAGE_SENSOR_PIN 33   // Voltage sensor analog input
+#define CURRENT_SENSOR_PIN 34   // ACS712 current sensor analog input
+
+// Sensor Calibration
+#define ACS712_SENSITIVITY   0.185   // V/A for 5A module (use 0.100 for 20A, 0.066 for 30A)
+#define ADC_VREF             3.3     // ESP32 ADC reference voltage
+#define ADC_RESOLUTION       4095.0  // 12-bit ADC
+#define VOLTAGE_SCALE_FACTOR 253.0   // Calibrated: 38.3V reading -> 220V display
+#define SENSOR_SAMPLES       50      // Samples for averaging
+#define CURRENT_THRESHOLD    0.1     // Ignore current below this (noise filter)
 
 // Timing Configuration
 #define DEMO_MODE          true  // true = 30s telemetry, false = 1h telemetry
@@ -47,9 +57,6 @@
 #define TELEMETRY_INTERVAL_DEMO_MS  30000      // 30 seconds (demo)
 #define TELEMETRY_INTERVAL_PROD_MS  3600000    // 1 hour (production)
 #define WIFI_RECONNECT_INTERVAL_MS  10000      // 10 seconds
-
-// Simulation Settings (for testing without real power sensors)
-#define SIMULATED_POWER_WATTS  100.0  // Examples: LED=10W, Fan=50W, TV=100W
 
 // ============================================
 // GLOBALS
@@ -64,15 +71,74 @@ unsigned long lastTelemetryTime = 0;
 unsigned long lastWiFiCheckTime = 0;
 
 float sessionEnergyKWh = 0.0;
+float acs712ZeroPoint = 0.0;  // Calibrated at startup
 
 const unsigned long TELEMETRY_INTERVAL_MS = DEMO_MODE ? TELEMETRY_INTERVAL_DEMO_MS : TELEMETRY_INTERVAL_PROD_MS;
+
+// ============================================
+// SENSOR READING
+// ============================================
+float readADCAverage(int pin) {
+  long total = 0;
+  for (int i = 0; i < SENSOR_SAMPLES; i++) {
+    total += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return (float)total / SENSOR_SAMPLES;
+}
+
+float readVoltage() {
+  float adcValue = readADCAverage(VOLTAGE_SENSOR_PIN);
+  float sensorVoltage = (adcValue / ADC_RESOLUTION) * ADC_VREF;
+  // Scale 5V DC to 220V AC equivalent
+  float scaledVoltage = sensorVoltage * VOLTAGE_SCALE_FACTOR;
+  return scaledVoltage;
+}
+
+float readCurrent() {
+  float adcValue = readADCAverage(CURRENT_SENSOR_PIN);
+  float sensorVoltage = (adcValue / ADC_RESOLUTION) * ADC_VREF;
+  // Calculate current using calibrated zero point
+  float current = (sensorVoltage - acs712ZeroPoint) / ACS712_SENSITIVITY;
+  current = abs(current);
+  // Filter noise
+  if (current < CURRENT_THRESHOLD) {
+    current = 0.0;
+  }
+  return current;
+}
+
+void calibrateCurrentSensor() {
+  Serial.println("[CAL] Calibrating current sensor (keep relay OFF)...");
+  delay(500);
+  float adcValue = readADCAverage(CURRENT_SENSOR_PIN);
+  acs712ZeroPoint = (adcValue / ADC_RESOLUTION) * ADC_VREF;
+  Serial.print("[CAL] Zero point: ");
+  Serial.print(acs712ZeroPoint, 3);
+  Serial.println("V");
+}
+
+float readPower() {
+  float voltage = readVoltage();
+  float current = readCurrent();
+  float power = voltage * current;
+  Serial.print("[SENSOR] V=");
+  Serial.print(voltage, 1);
+  Serial.print("V I=");
+  Serial.print(current, 3);
+  Serial.print("A P=");
+  Serial.print(power, 1);
+  Serial.println("W");
+  return power;
+}
 
 // ============================================
 // RELAY CONTROL
 // ============================================
 void setRelay(bool state) {
   relayState = state;
-  digitalWrite(RELAY_PIN, state ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, state ? HIGH : LOW);  // Normal logic: ON=HIGH, OFF=LOW
+  digitalWrite(LED_PIN, state ? HIGH : LOW);    // LED mirrors relay state
   Serial.print("[RELAY] ");
   Serial.println(state ? "ON" : "OFF");
 }
@@ -81,24 +147,13 @@ void setRelay(bool state) {
 // ENERGY CALCULATION
 // ============================================
 float calculateEnergy(unsigned long deltaMs) {
-  /*
-   * Currently using SIMULATED energy data.
-   *
-   * For real sensors (PZEM-004T, ACS712, CT Clamp), replace with:
-   *
-   * float voltage = readVoltageSensor();
-   * float current = readCurrentSensor();
-   * float power = voltage * current;  // Watts
-   * float hours = deltaMs / 3600000.0;
-   * return (power * hours) / 1000.0;  // kWh
-   */
-
   if (!relayState) {
     return 0.0;
   }
 
+  float power = readPower();
   float hours = deltaMs / 3600000.0;
-  return (SIMULATED_POWER_WATTS * hours) / 1000.0;
+  return (power * hours) / 1000.0;  // kWh
 }
 
 // ============================================
@@ -321,15 +376,16 @@ void setup() {
   Serial.println("========================================");
   Serial.print("Mode: ");
   Serial.println(DEMO_MODE ? "DEMO (30s telemetry)" : "PRODUCTION (1h telemetry)");
-  Serial.print("Simulated Power: ");
-  Serial.print(SIMULATED_POWER_WATTS);
-  Serial.println("W");
+  Serial.println("Sensors: ACS712 + Voltage (5V->220V)");
   Serial.println("========================================");
 
   pinMode(LED_PIN, OUTPUT);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, LOW);   // Start OFF (normal logic: LOW=OFF)
+
+  // Calibrate current sensor while relay is OFF (no current flowing)
+  calibrateCurrentSensor();
 
   connectWiFi();
 
@@ -337,7 +393,7 @@ void setup() {
     Serial.print("[SIO] Connecting to ");
     Serial.println(SERVER_HOST);
 
-    socketIO.beginSSL(SERVER_HOST, SERVER_PORT, "/socket.io/?EIO=3&transport=websocket");
+    socketIO.beginSSL(SERVER_HOST, SERVER_PORT, "/socket.io/?EIO=3transport=websocket");
     socketIO.onEvent(socketIOEvent);
     socketIO.setReconnectInterval(10000);
   }
